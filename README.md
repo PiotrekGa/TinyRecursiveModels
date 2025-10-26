@@ -18,6 +18,32 @@ This work came to be after I learned about the recent innovative Hierarchical Re
 
 Tiny Recursion Model (TRM) recursively improves its predicted answer y with a tiny network. It starts with the embedded input question x and initial embedded answer y and latent z. For up to K improvements steps, it tries to improve its answer y. It does so by i) recursively updating n times its latent z given the question x, current answer y, and current latent z (recursive reasoning), and then ii) updating its answer y given the current answer y and current latent z. This recursive process allows the model to progressively improve its answer (potentially addressing any errors from its previous answer) in an extremely parameter-efficient manner while minimizing overfitting.
 
+### Model Variants
+
+#### TRM with Multi-Scale Patch Embeddings (TRM-Patches)
+
+For ARC-AGI tasks, we provide an enhanced variant `TinyRecursiveReasoningModel_ACTV1_Patches` that incorporates Vision Transformer-inspired patch embeddings at multiple scales. This variant adds spatial pattern recognition capabilities while preserving token-level reasoning.
+
+**Key Features:**
+- **Multi-scale patches**: Extracts patches at 4 different scales (2×2, 3×3, 5×5, 6×6) to capture patterns from fine to coarse
+- **Residual design**: Token-level features are always preserved via residual connections, ensuring the model can read individual cells when needed
+- **Learnable gating**: The model learns per-token weights to dynamically balance between token-level and patch-level information
+- **ARC-optimized**: Specifically designed for 30×30 grid inputs
+
+**Usage:**
+```bash
+# Use arch=trm_patches instead of arch=trm
+run_name="pretrain_patches_arc2concept"
+torchrun --nproc-per-node 4 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
+arch=trm_patches \
+data_paths="[data/arc2concept-aug-1000]" \
+arch.L_layers=2 \
+arch.H_cycles=3 arch.L_cycles=4 \
++run_name=${run_name} ema=True
+```
+
+All hyperparameters from the base TRM model are compatible with the patches variant.
+
 ### Requirements
 
 - Python 3.10 (or similar)
