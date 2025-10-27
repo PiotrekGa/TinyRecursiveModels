@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 import copy
+import time
 
 import torch
 import torch.distributed as dist
@@ -84,6 +85,7 @@ class PretrainConfig(pydantic.BaseModel):
     freeze_weights: bool = (
         False  # If True, freeze weights and only learn the embeddings
     )
+    disable_wandb: bool = False  # If True, disable wandb logging
 
 
 @dataclass
@@ -565,7 +567,7 @@ def evaluate(
 
 
 def save_code_and_config(config: PretrainConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -587,7 +589,8 @@ def save_code_and_config(config: PretrainConfig):
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    if not config.disable_wandb and wandb.run is not None:
+        wandb.run.log_code(config.checkpoint_path)
 
 
 def load_synced_config(
@@ -697,11 +700,12 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log(
-            {"num_params": sum(x.numel() for x in train_state.model.parameters())},
-            step=0,
-        )
+        if not config.disable_wandb:
+            wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+            wandb.log(
+                {"num_params": sum(x.numel() for x in train_state.model.parameters())},
+                step=0,
+            )
         save_code_and_config(config)
     if config.ema:
         print("Setup EMA")
@@ -709,6 +713,9 @@ def launch(hydra_config: DictConfig):
         ema_helper.register(train_state.model)
 
     # Training Loop
+    total_train_time = 0.0
+    total_eval_time = 0.0
+
     for _iter_id in range(total_iters):
         print(
             f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}"
@@ -717,6 +724,7 @@ def launch(hydra_config: DictConfig):
         ############ Train Iter
         if RANK == 0:
             print("TRAIN")
+        train_start_time = time.time()
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(
@@ -729,15 +737,19 @@ def launch(hydra_config: DictConfig):
             )
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                if not config.disable_wandb:
+                    wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+        train_end_time = time.time()
+        total_train_time += train_end_time - train_start_time
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
             if RANK == 0:
                 print("EVALUATE")
+            eval_start_time = time.time()
             if config.ema:
                 print("SWITCH TO EMA")
                 train_state_eval = copy.deepcopy(train_state)
@@ -755,9 +767,12 @@ def launch(hydra_config: DictConfig):
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP,
             )
+            eval_end_time = time.time()
+            total_eval_time += eval_end_time - eval_start_time
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                if not config.disable_wandb:
+                    wandb.log(metrics, step=train_state.step)
 
             ############ Checkpointing
             if RANK == 0:
@@ -771,9 +786,40 @@ def launch(hydra_config: DictConfig):
                 del train_state_eval
 
     # finalize
+    if RANK == 0:
+        print("\n" + "=" * 60)
+        print("TRAINING COMPLETED - TIMING SUMMARY")
+        print("=" * 60)
+        print(
+            f"Total Training Time:   {total_train_time:.2f} seconds ({total_train_time/60:.2f} minutes)"
+        )
+        print(
+            f"Total Evaluation Time: {total_eval_time:.2f} seconds ({total_eval_time/60:.2f} minutes)"
+        )
+        print(
+            f"Total Time:            {total_train_time + total_eval_time:.2f} seconds ({(total_train_time + total_eval_time)/60:.2f} minutes)"
+        )
+        print("=" * 60)
+
+        # Log timing to wandb
+        if not config.disable_wandb:
+            wandb.log(
+                {
+                    "timing/total_train_seconds": total_train_time,
+                    "timing/total_eval_seconds": total_eval_time,
+                    "timing/total_seconds": total_train_time + total_eval_time,
+                    "timing/total_train_minutes": total_train_time / 60,
+                    "timing/total_eval_minutes": total_eval_time / 60,
+                    "timing/total_minutes": (total_train_time + total_eval_time) / 60,
+                },
+                step=train_state.step,
+            )
+
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+
+    if not config.disable_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
